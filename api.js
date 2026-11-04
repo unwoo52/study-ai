@@ -1,4 +1,6 @@
-import { SOLVE_SYSTEM, SOLVE_SCHEMA, SOLVE_REQUEST, WEB_SYSTEM, webRequest } from './prompt.js';
+import {
+  QUICK_REQUEST, QUICK_SCHEMA, QUICK_SYSTEM, SOLVE_REQUEST, SOLVE_SCHEMA, SOLVE_SYSTEM, WEB_SYSTEM, webRequest,
+} from './prompt.js';
 
 // 달러 / 100만 토큰. 가격이 바뀌면 여기만 고친다.
 export const MODELS = {
@@ -7,9 +9,13 @@ export const MODELS = {
   'claude-haiku-5-5': { label: 'Haiku 5.5 (가장 저렴)', input: 0.1, output: 0.5, fallbacks: false },
 };
 
+// 빠른 답은 설정의 모델과 상관없이 가장 빠르고 저렴한 모델을 쓴다.
+export const QUICK_MODEL = 'claude-haiku-5-5';
+
 const WEB_SEARCH_PRICE = 0.01;
 const MAX_ATTEMPTS = 4;
 const REQUEST_TIMEOUT_MS = 180000;
+const QUICK_TIMEOUT_MS = 20000;
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -33,7 +39,7 @@ function friendlyError(status, message) {
   return `API 오류 ${status}: ${message}`;
 }
 
-async function callClaude(body, apiKey) {
+async function callClaude(body, apiKey, { attempts = MAX_ATTEMPTS, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   const headers = {
     'content-type': 'application/json',
     'x-api-key': apiKey,
@@ -47,7 +53,7 @@ async function callClaude(body, apiKey) {
   }
 
   let lastError;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) await wait(lastError.delay);
     let response;
     try {
@@ -55,7 +61,7 @@ async function callClaude(body, apiKey) {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       lastError = Object.assign(new Error(`네트워크 오류: ${error.message}`), { delay: 2000 * 2 ** attempt });
@@ -80,19 +86,35 @@ function checkStop(data) {
 
 const textOf = (content) => content.filter((block) => block.type === 'text').map((block) => block.text).join('');
 
+const photoMessage = (imageBase64, request) => ({
+  role: 'user',
+  content: [
+    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
+    { type: 'text', text: request },
+  ],
+});
+
+// 생각 단계를 끄고 짧게 받아서 몇 초 안에 답을 얻는다. 늦어지면 의미가 없어서 재시도도 한 번만 한다.
+export async function quickSolve(imageBase64, apiKey) {
+  const data = await callClaude({
+    model: QUICK_MODEL,
+    max_tokens: 128,
+    system: QUICK_SYSTEM,
+    thinking: { type: 'disabled' },
+    output_config: { effort: 'low', format: { type: 'json_schema', schema: QUICK_SCHEMA } },
+    messages: [photoMessage(imageBase64, QUICK_REQUEST)],
+  }, apiKey, { attempts: 2, timeoutMs: QUICK_TIMEOUT_MS });
+  checkStop(data);
+  return { result: JSON.parse(textOf(data.content)), usage: readUsage(data), model: data.model ?? QUICK_MODEL };
+}
+
 export async function solve(imageBase64, { apiKey, model, effort }) {
   const data = await callClaude({
     model,
     max_tokens: 16000,
     system: SOLVE_SYSTEM,
     output_config: { effort, format: { type: 'json_schema', schema: SOLVE_SCHEMA } },
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
-        { type: 'text', text: SOLVE_REQUEST },
-      ],
-    }],
+    messages: [photoMessage(imageBase64, SOLVE_REQUEST)],
   }, apiKey);
   checkStop(data);
   return { result: JSON.parse(textOf(data.content)), usage: readUsage(data), model: data.model ?? model };

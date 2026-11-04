@@ -314,6 +314,17 @@ summary { color: var(--muted); font-size: 14px; padding: 8px 0; }
   background: var(--panel);
 }
 
+.quick {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+  text-align: left;
+}
+.quick small { display: block; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.quick strong { font-size: 28px; line-height: 1.3; color: var(--accent); }
+
 .status {
   display: flex;
   flex-direction: column;

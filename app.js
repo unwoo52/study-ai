@@ -1,4 +1,4 @@
-import { MODELS, SOURCE_PROVIDERS, costOf, solve } from './api.js';
+import { MODELS, SOURCE_PROVIDERS, costOf, quickSolve, solve } from './api.js';
 import { DIFFICULTY_LABELS, TRAP_LABELS } from './prompt.js';
 import { appendLog, clearItems, loadItems, readLog, saveItem } from './store.js';
 
@@ -40,6 +40,7 @@ const queue = [];
 const slides = new Map();
 const chips = new Map();
 const photoUrls = new Map();
+const quickRunning = new Set();
 let running = 0;
 
 function h(tag, attrs = {}, ...children) {
@@ -53,16 +54,18 @@ function h(tag, attrs = {}, ...children) {
 }
 
 const usd = (value) => `$${value.toFixed(4)}`;
+const seconds = (ms) => (ms / 1000).toFixed(1);
 
 function itemCost(item) {
   let total = item.solve ? costOf(item.solve.usage, item.solve.model) : 0;
+  if (item.quick) total += costOf(item.quick.usage, item.quick.model);
   for (const source of Object.values(item.sources)) {
     if (source.usage) total += costOf(source.usage, item.solve?.model);
   }
   return total;
 }
 
-const questionNumber = (item) => item.solve?.result.question_number ?? null;
+const questionNumber = (item) => item.solve?.result.question_number ?? item.quick?.result.question_number ?? null;
 const itemLabel = (item) => questionNumber(item) ?? (item.solve ? '?' : '…');
 
 // 화면의 문제 번호 순서. 번호를 모르는 사진은 뒤로 보내고 찍은 순서를 유지한다.
@@ -72,7 +75,7 @@ function byQuestionNumber(a, b) {
 
 function spending() {
   const solved = items.filter((item) => item.solve);
-  const total = solved.reduce((sum, item) => sum + itemCost(item), 0);
+  const total = items.reduce((sum, item) => sum + itemCost(item), 0);
   // 모델이 섞이면 평균이 왜곡되므로 예상치는 지금 고른 모델의 결과로만 낸다.
   const sample = solved.filter((item) => item.solve.model === settings.model);
   const average = sample.length > 0 ? sample.reduce((sum, item) => sum + itemCost(item), 0) / sample.length : 0;
@@ -142,6 +145,8 @@ function pump() {
     if (queue.length > 0 && !$('settings').open) openSettings();
     return;
   }
+  // 빠른 답은 풀이 순서를 기다리지 않고 바로 보낸다.
+  queue.forEach(quickAnswer);
   while (running < MAX_PARALLEL && queue.length > 0) {
     running++;
     analyze(queue.shift()).finally(() => {
@@ -149,6 +154,25 @@ function pump() {
       pump();
     });
   }
+}
+
+async function quickAnswer(item) {
+  if (item.quick || item.solve || quickRunning.has(item.id)) return;
+  quickRunning.add(item.id);
+  item.quickError = null;
+  refresh(item);
+  const startedAt = performance.now();
+  try {
+    item.quick = await quickSolve(await toBase64(item.photo), settings.apiKey);
+    item.quick.ms = performance.now() - startedAt;
+  } catch (error) {
+    item.quickError = error.message;
+  }
+  quickRunning.delete(item.id);
+  if (!slides.has(item.id)) return;
+  await saveItem(item);
+  placeInOrder();
+  refresh(item);
 }
 
 async function analyze(item) {
@@ -167,7 +191,7 @@ async function analyze(item) {
     item.error = error.message;
   }
   await saveItem(item);
-  placeInOrder(item);
+  placeInOrder();
   refresh(item);
   if (item.status !== 'done') return;
   if (settings.autoSources) await Promise.all(SOURCE_PROVIDERS.map((provider) => findSource(item, provider)));
@@ -198,6 +222,7 @@ function logEntry(item) {
     `[번역]\n${result.question_ko}`,
     ...result.choices.map((c) => `${c.label}) ${c.text_ko}${c.is_correct ? ' ← 정답' : ''}`),
     `[정답] ${result.answer_label} (신뢰도 ${result.confidence})`,
+    item.quick && `[빠른 답] ${item.quick.result.answer_label} (${seconds(item.quick.ms)}초)`,
     `[해설]\n${result.explanation_ko}`,
     result.difficulty && `[난이도] ${DIFFICULTY_LABELS[result.difficulty.tier]} `
       + `(예상 정답률 ${result.difficulty.estimated_correct_rate}%): ${result.difficulty.reason}`,
@@ -233,16 +258,29 @@ async function downloadLog() {
 
 /* 카드 그리기 */
 
+function renderQuick(item) {
+  if (item.quick) {
+    return h('div', { class: 'quick' },
+      h('small', {}, `빠른 답 · ${seconds(item.quick.ms)}초 · 풀이로 확인 전`),
+      h('strong', {}, item.quick.result.answer_label));
+  }
+  if (quickRunning.has(item.id)) return h('div', { class: 'quick' }, h('small', {}, '빠른 답 찾는 중...'));
+  if (item.quickError) return h('div', { class: 'quick' }, h('small', {}, `빠른 답 실패: ${item.quickError}`));
+  return null;
+}
+
 function renderStatus(item) {
   if (item.status === 'error') {
     return h('div', { class: 'status error' },
+      renderQuick(item),
       h('img', { src: photoUrl(item), alt: '촬영한 문제 사진' }),
       h('p', {}, item.error),
       h('button', { class: 'btn', onclick: () => enqueue(item) }, '다시 시도'));
   }
   return h('div', { class: 'status' },
-    h('img', { src: photoUrl(item), alt: '촬영한 문제 사진' }),
-    h('p', {}, item.status === 'queued' ? '순서를 기다리는 중...' : '분석 중...'));
+    renderQuick(item),
+    h('p', {}, item.status === 'queued' ? '풀이 순서를 기다리는 중...' : '풀이 진행 중...'),
+    h('img', { src: photoUrl(item), alt: '촬영한 문제 사진' }));
 }
 
 const TRAP_VERDICTS = {
@@ -251,6 +289,8 @@ const TRAP_VERDICTS = {
   detected: '함정 발견',
 };
 const CONFIDENCE = { high: '높음', medium: '보통', low: '낮음' };
+
+const bareLabel = (label) => label.replace(/[\s.)）]/g, '');
 
 function renderTrap(trap) {
   return [
@@ -286,13 +326,17 @@ function renderProvider(item, provider) {
 function renderResult(item) {
   const { result, model } = item.solve;
   const correct = result.choices.find((choice) => choice.is_correct);
+  const quickLabel = item.quick?.result.answer_label;
+  const quickAgrees = quickLabel != null && bareLabel(quickLabel) === bareLabel(result.answer_label);
   return h('div', { class: 'card' },
     h('div', { class: 'head' },
       h('button', { class: 'thumb', 'aria-label': '사진 크게 보기', onclick: () => zoomPhoto(item) },
         h('img', { src: photoUrl(item), alt: '' })),
       h('div', { class: 'answer' },
-        h('small', {}, `정답 · 신뢰도 ${CONFIDENCE[result.confidence]}`),
+        h('small', {}, `정답 · 신뢰도 ${CONFIDENCE[result.confidence]}${quickAgrees ? ' · 빠른 답과 같음' : ''}`),
         h('strong', {}, `${result.answer_label}${correct ? `) ${correct.text_ko}` : ''}`))),
+    quickLabel != null && !quickAgrees && h('div', { class: 'notice detected' },
+      `빠른 답(${quickLabel})과 달라요. 풀이 결과 ${result.answer_label}를 따르세요.`),
     result.image_quality !== 'good' && h('div', { class: 'notice' },
       `사진이 잘 안 읽혀요. ${result.image_note}`),
     result.trap_check.verdict !== 'clean' && h('div', { class: `notice ${result.trap_check.verdict}` },
@@ -332,13 +376,21 @@ function addSlide(item) {
   refresh(item);
 }
 
-function placeInOrder(item) {
+function placeInOrder() {
   const index = currentIndex();
   const viewing = items[index];
   items.sort(byQuestionNumber);
-  const next = items[items.indexOf(item) + 1];
-  deck.insertBefore(slides.get(item.id), next ? slides.get(next.id) : camSlide);
-  $('chips').insertBefore(chips.get(item.id), next ? chips.get(next.id) : null);
+  // 여러 카드의 번호가 거의 동시에 정해질 수 있어서 전체 순서를 맞춘다. 제자리인 카드는 건드리지 않는다.
+  let nextSlide = camSlide;
+  let nextChip = null;
+  for (const { id } of [...items].reverse()) {
+    const slide = slides.get(id);
+    const chip = chips.get(id);
+    if (slide.nextElementSibling !== nextSlide) deck.insertBefore(slide, nextSlide);
+    if (chip.nextElementSibling !== nextChip) $('chips').insertBefore(chip, nextChip);
+    nextSlide = slide;
+    nextChip = chip;
+  }
   // 보던 카드의 위치가 밀렸을 때만 옮긴다. 넘기는 도중의 손동작을 끊지 않기 위해서다.
   const target = viewing ? items.indexOf(viewing) : items.length;
   if (target !== index) goTo(target);
@@ -354,7 +406,8 @@ function refresh(item) {
   const verdict = item.status === 'done' ? item.solve.result.trap_check.verdict : '';
   chip.className = `chip ${item.status} ${verdict}`;
   chip.replaceChildren(String(itemLabel(item)));
-  if (item.status === 'done') chip.append(h('b', {}, item.solve.result.answer_label));
+  const answer = item.status === 'done' ? item.solve.result.answer_label : item.quick?.result.answer_label;
+  if (answer) chip.append(h('b', {}, answer));
   if (item.status === 'error') chip.append('!');
   updateHeader();
 }
@@ -362,7 +415,8 @@ function refresh(item) {
 /* 화면 이동 */
 
 function currentIndex() {
-  return Math.round(deck.scrollLeft / deck.clientWidth);
+  // 화면이 가려져 폭이 0이면 위치를 계산할 수 없으므로 카메라 칸으로 본다.
+  return deck.clientWidth ? Math.round(deck.scrollLeft / deck.clientWidth) : items.length;
 }
 
 function goTo(index) {
@@ -446,6 +500,11 @@ function openSettings() {
     $('stats').textContent = `지금까지 총 ${usd(total)}\n`
       + `${settings.model} ${sample.length}문제 기준 평균 ${usd(average)}, ${(avgMs / 1000).toFixed(1)}초\n`
       + `${settings.target}문제 예상 $${projected.toFixed(2)} (${verdict}, 예산 $${settings.budget})`;
+    const quick = sample.filter((item) => item.quick);
+    if (quick.length > 0) {
+      const quickMs = quick.reduce((sum, item) => sum + item.quick.ms, 0) / quick.length;
+      $('stats').textContent += `\n빠른 답 평균 ${seconds(quickMs)}초`;
+    }
   } else {
     $('stats').textContent = '';
   }
