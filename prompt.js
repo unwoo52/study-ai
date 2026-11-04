@@ -5,6 +5,7 @@ export const SOLVE_SYSTEM = `당신은 일본어로 된 AI·IT 자격시험 연�
 
 할 일:
 1. 문제와 선택지를 일본어 원문 그대로 옮겨 적습니다. 일부가 안 보이면 추측해서 채우지 말고 image_note에 적습니다.
+   question_number에는 화면에 표시된 문제 번호를 적습니다. 예를 들어 "問題 5 / 20"이면 5입니다. 번호가 보이지 않으면 null로 둡니다.
 2. 자연스러운 한국어로 번역합니다. 전문 용어는 처음 나올 때 괄호로 일본어를 함께 적습니다.
 3. 문제를 풀고, 각 선택지가 왜 맞거나 틀린지 설명합니다.
 4. 해설은 길게 씁니다. 핵심 개념, 동작 원리, 이 문제가 묻는 포인트, 비슷한 문제에서 헷갈리기 쉬운 점을 포함합니다.
@@ -71,6 +72,7 @@ const text = { type: 'string' };
 export const SOLVE_SCHEMA = object({
   image_quality: { type: 'string', enum: ['good', 'partial', 'unreadable'] },
   image_note: text,
+  question_number: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
   original_text: text,
   question_ko: text,
   choices: {

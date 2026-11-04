@@ -62,6 +62,14 @@ function itemCost(item) {
   return total;
 }
 
+const questionNumber = (item) => item.solve?.result.question_number ?? null;
+const itemLabel = (item) => questionNumber(item) ?? (item.solve ? '?' : '…');
+
+// 화면의 문제 번호 순서. 번호를 모르는 사진은 뒤로 보내고 찍은 순서를 유지한다.
+function byQuestionNumber(a, b) {
+  return (questionNumber(a) ?? Infinity) - (questionNumber(b) ?? Infinity) || a.n - b.n;
+}
+
 function spending() {
   const solved = items.filter((item) => item.solve);
   const total = solved.reduce((sum, item) => sum + itemCost(item), 0);
@@ -105,7 +113,7 @@ function photoUrl(item) {
 async function addPhoto(photo) {
   const item = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    n: (items.at(-1)?.n ?? 0) + 1,
+    n: Math.max(0, ...items.map((other) => other.n)) + 1,
     createdAt: Date.now(),
     photo,
     status: 'queued',
@@ -159,6 +167,7 @@ async function analyze(item) {
     item.error = error.message;
   }
   await saveItem(item);
+  placeInOrder(item);
   refresh(item);
   if (item.status !== 'done') return;
   if (settings.autoSources) await Promise.all(SOURCE_PROVIDERS.map((provider) => findSource(item, provider)));
@@ -184,7 +193,7 @@ function logEntry(item) {
   const { result, model } = item.solve;
   const when = new Date(item.createdAt).toLocaleString('ko-KR');
   const lines = [
-    `=== #${item.n} | ${when} | ${model} | ${usd(itemCost(item))} | ${(item.solveMs / 1000).toFixed(1)}초 ===`,
+    `=== 문제 ${itemLabel(item)} (촬영 #${item.n}) | ${when} | ${model} | ${usd(itemCost(item))} | ${(item.solveMs / 1000).toFixed(1)}초 ===`,
     `[원문]\n${result.original_text}`,
     `[번역]\n${result.question_ko}`,
     ...result.choices.map((c) => `${c.label}) ${c.text_ko}${c.is_correct ? ' ← 정답' : ''}`),
@@ -323,6 +332,18 @@ function addSlide(item) {
   refresh(item);
 }
 
+function placeInOrder(item) {
+  const index = currentIndex();
+  const viewing = items[index];
+  items.sort(byQuestionNumber);
+  const next = items[items.indexOf(item) + 1];
+  deck.insertBefore(slides.get(item.id), next ? slides.get(next.id) : camSlide);
+  $('chips').insertBefore(chips.get(item.id), next ? chips.get(next.id) : null);
+  // 보던 카드의 위치가 밀렸을 때만 옮긴다. 넘기는 도중의 손동작을 끊지 않기 위해서다.
+  const target = viewing ? items.indexOf(viewing) : items.length;
+  if (target !== index) goTo(target);
+}
+
 function refresh(item) {
   const slide = slides.get(item.id);
   const top = slide.scrollTop;
@@ -332,7 +353,7 @@ function refresh(item) {
   const chip = chips.get(item.id);
   const verdict = item.status === 'done' ? item.solve.result.trap_check.verdict : '';
   chip.className = `chip ${item.status} ${verdict}`;
-  chip.replaceChildren(String(item.n));
+  chip.replaceChildren(String(itemLabel(item)));
   if (item.status === 'done') chip.append(h('b', {}, item.solve.result.answer_label));
   if (item.status === 'error') chip.append('!');
   updateHeader();
@@ -346,17 +367,18 @@ function currentIndex() {
 
 function goTo(index) {
   deck.scrollTo({ left: index * deck.clientWidth, behavior: 'auto' });
+  updateHeader();
 }
 
 function updateHeader() {
   const index = currentIndex();
-  $('pos').textContent = index >= items.length ? `촬영 (${items.length}장)` : `${items[index].n}번 문제`;
+  $('pos').textContent = index >= items.length ? `촬영 (${items.length}장)` : `${itemLabel(items[index])}번 문제`;
   const { sample, total, projected } = spending();
   const estimate = sample.length > 0 ? ` · ${settings.target}문제 예상 $${projected.toFixed(2)}` : '';
   $('spent').textContent = total > 0 ? `${usd(total)}${estimate}` : '';
   $('spent').classList.toggle('over', projected > settings.budget);
   items.forEach((item, i) => chips.get(item.id).classList.toggle('active', i === index));
-  chips.get(items[index]?.id)?.scrollIntoView({ inline: 'center', block: 'nearest' });
+  chips.get(items[index]?.id)?.scrollIntoView({ block: 'nearest' });
 }
 
 function zoomPhoto(item) {
@@ -503,7 +525,7 @@ function wireEvents() {
 
 async function restore() {
   const saved = await loadItems();
-  saved.sort((a, b) => a.n - b.n);
+  saved.sort(byQuestionNumber);
   for (const item of saved) {
     for (const [id, source] of Object.entries(item.sources)) {
       if (source.status === 'running') delete item.sources[id];
