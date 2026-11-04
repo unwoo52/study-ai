@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#14161a">
+  <title>문제 풀이</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="top">
+    <span id="pos">촬영</span>
+    <span id="spent"></span>
+    <button id="openSettings" class="icon" aria-label="설정">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>
+    </button>
+  </header>
+
+  <main id="deck">
+    <section id="cam" class="slide">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="flash"></div>
+      <div id="camFallback" hidden>
+        <p id="camReason"></p>
+      </div>
+      <div id="camControls">
+        <label class="side">
+          갤러리
+          <input id="gallery" type="file" accept="image/*" multiple hidden>
+        </label>
+        <button id="shutter" aria-label="촬영"></button>
+        <label class="side">
+          기본 카메라
+          <input id="native" type="file" accept="image/*" capture="environment" hidden>
+        </label>
+      </div>
+    </section>
+  </main>
+
+  <nav id="rail">
+    <div id="chips"></div>
+    <button id="goCam" class="icon" aria-label="카메라로 이동">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+    </button>
+  </nav>
+
+  <div id="toast" role="alert" hidden></div>
+
+  <dialog id="settings">
+    <form method="dialog">
+      <h2>설정</h2>
+      <label>Anthropic API 키
+        <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-...">
+        <small>이 기기의 브라우저에만 저장돼요. 사진과 함께 Anthropic으로만 전송됩니다.</small>
+      </label>
+      <label>모델
+        <select id="model"></select>
+      </label>
+      <label>풀이 깊이
+        <select id="effort">
+          <option value="low">낮음 (빠르고 저렴)</option>
+          <option value="medium">보통</option>
+          <option value="high">높음 (느리고 비쌈)</option>
+        </select>
+      </label>
+      <label class="row">
+        <input id="autoSources" type="checkbox">
+        웹 검색 출처를 자동으로 찾기
+      </label>
+      <div class="pair">
+        <label>예산 ($)
+          <input id="budget" type="number" inputmode="decimal" min="0.1" step="0.1">
+        </label>
+        <label>목표 문제 수
+          <input id="target" type="number" inputmode="numeric" min="1">
+        </label>
+      </div>
+      <p id="stats"></p>
+      <div class="actions">
+        <button type="button" id="downloadLog">기록 내려받기</button>
+        <button type="button" id="rerunAll">전체 다시 풀기</button>
+      </div>
+      <div class="actions">
+        <button type="button" id="clearAll" class="danger">카드 모두 지우기</button>
+      </div>
+      <button id="closeSettings" class="primary" value="save">저장</button>
+    </form>
+  </dialog>
+
+  <dialog id="zoom"><img alt="촬영한 문제 사진"></dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
