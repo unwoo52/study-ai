@@ -1,5 +1,5 @@
 import { MODELS, SOURCE_PROVIDERS, costOf, solve } from './api.js';
-import { TRAP_LABELS } from './prompt.js';
+import { DIFFICULTY_LABELS, TRAP_LABELS } from './prompt.js';
 import { appendLog, clearItems, loadItems, readLog, saveItem } from './store.js';
 
 const IMAGE_MAX_EDGE = 2000;
@@ -65,8 +65,10 @@ function itemCost(item) {
 function spending() {
   const solved = items.filter((item) => item.solve);
   const total = solved.reduce((sum, item) => sum + itemCost(item), 0);
-  const average = solved.length > 0 ? total / solved.length : 0;
-  return { count: solved.length, total, average, projected: average * settings.target };
+  // 모델이 섞이면 평균이 왜곡되므로 예상치는 지금 고른 모델의 결과로만 낸다.
+  const sample = solved.filter((item) => item.solve.model === settings.model);
+  const average = sample.length > 0 ? sample.reduce((sum, item) => sum + itemCost(item), 0) / sample.length : 0;
+  return { sample, total, average, projected: average * settings.target };
 }
 
 /* 사진 처리 */
@@ -188,6 +190,8 @@ function logEntry(item) {
     ...result.choices.map((c) => `${c.label}) ${c.text_ko}${c.is_correct ? ' ← 정답' : ''}`),
     `[정답] ${result.answer_label} (신뢰도 ${result.confidence})`,
     `[해설]\n${result.explanation_ko}`,
+    result.difficulty && `[난이도] ${DIFFICULTY_LABELS[result.difficulty.tier]} `
+      + `(예상 정답률 ${result.difficulty.estimated_correct_rate}%): ${result.difficulty.reason}`,
     `[함정 점검] ${result.trap_check.verdict}: ${result.trap_check.summary}`,
     ...result.trap_check.findings.map((f) => `- ${TRAP_LABELS[f.type]} / ${f.location}: ${f.evidence}`),
     `[AI 지식 출처]`,
@@ -198,7 +202,7 @@ function logEntry(item) {
     if (source?.status !== 'done') continue;
     lines.push(`[${provider.label}]\n${source.text}`, ...source.links.map((l) => `- ${l.title}: ${l.url}`));
   }
-  return `${lines.join('\n')}\n\n`;
+  return `${lines.filter(Boolean).join('\n')}\n\n`;
 }
 
 async function logItem(item) {
@@ -284,6 +288,10 @@ function renderResult(item) {
       `사진이 잘 안 읽혀요. ${result.image_note}`),
     result.trap_check.verdict !== 'clean' && h('div', { class: `notice ${result.trap_check.verdict}` },
       h('b', {}, TRAP_VERDICTS[result.trap_check.verdict]), ` ${result.trap_check.summary}`),
+    result.difficulty && h('div', { class: `difficulty ${result.difficulty.tier}` },
+      h('b', {}, DIFFICULTY_LABELS[result.difficulty.tier]),
+      h('span', {}, `예상 정답률 ${result.difficulty.estimated_correct_rate}%`),
+      h('small', {}, result.difficulty.reason)),
     h('h3', {}, '문제'),
     h('p', {}, result.question_ko),
     h('h3', {}, '선택지'),
@@ -343,8 +351,9 @@ function goTo(index) {
 function updateHeader() {
   const index = currentIndex();
   $('pos').textContent = index >= items.length ? `촬영 (${items.length}장)` : `${items[index].n}번 문제`;
-  const { total, projected } = spending();
-  $('spent').textContent = total > 0 ? `${usd(total)} · ${settings.target}문제 예상 $${projected.toFixed(2)}` : '';
+  const { sample, total, projected } = spending();
+  const estimate = sample.length > 0 ? ` · ${settings.target}문제 예상 $${projected.toFixed(2)}` : '';
+  $('spent').textContent = total > 0 ? `${usd(total)}${estimate}` : '';
   $('spent').classList.toggle('over', projected > settings.budget);
   items.forEach((item, i) => chips.get(item.id).classList.toggle('active', i === index));
   chips.get(items[index]?.id)?.scrollIntoView({ inline: 'center', block: 'nearest' });
@@ -408,12 +417,12 @@ function openSettings() {
   $('autoSources').checked = settings.autoSources;
   $('budget').value = settings.budget;
   $('target').value = settings.target;
-  const { count, total, average, projected } = spending();
-  if (count > 0) {
-    const solved = items.filter((item) => item.solve);
-    const avgMs = solved.reduce((sum, item) => sum + item.solveMs, 0) / count;
+  const { sample, total, average, projected } = spending();
+  if (sample.length > 0) {
+    const avgMs = sample.reduce((sum, item) => sum + item.solveMs, 0) / sample.length;
     const verdict = projected > settings.budget ? '예산 초과' : '예산 안';
-    $('stats').textContent = `${count}문제, 총 ${usd(total)}, 문제당 평균 ${usd(average)}, ${(avgMs / 1000).toFixed(1)}초\n`
+    $('stats').textContent = `지금까지 총 ${usd(total)}\n`
+      + `${settings.model} ${sample.length}문제 기준 평균 ${usd(average)}, ${(avgMs / 1000).toFixed(1)}초\n`
       + `${settings.target}문제 예상 $${projected.toFixed(2)} (${verdict}, 예산 $${settings.budget})`;
   } else {
     $('stats').textContent = '';

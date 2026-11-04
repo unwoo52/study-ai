@@ -236,6 +236,22 @@ button, input, select { font: inherit; color: inherit; }
 .notice.detected { border-color: var(--bad); }
 .notice.clean { border-color: var(--good); }
 
+.difficulty {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 2px 12px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 15px;
+}
+.difficulty small { flex-basis: 100%; color: var(--muted); font-size: 14px; line-height: 1.5; }
+.difficulty.must_get b { color: var(--bad); }
+.difficulty.pass_line b { color: var(--accent); }
+.difficulty.discriminator b { color: var(--good); }
+
 .card h3 {
   margin: 20px 0 6px;
   color: var(--muted);
@@ -339,6 +355,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 #settings input[type=checkbox] { width: 20px; height: 20px; }
 #settings small { display: block; margin-top: 4px; color: var(--muted); }
 .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+#settings .hint { margin: -6px 0 14px; }
 #stats { margin: 0 0 14px; color: var(--muted); font-size: 14px; white-space: pre-line; }
 .actions { display: flex; gap: 8px; margin-bottom: 12px; }
 .actions button, .primary {
