@@ -90,7 +90,9 @@ async function shrink(source, width, height) {
   canvas.width = Math.round(width * scale);
   canvas.height = Math.round(height * scale);
   canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
-  return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', IMAGE_QUALITY));
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', IMAGE_QUALITY));
+  canvas.width = 0;
+  return blob;
 }
 
 async function addFiles(files) {
@@ -112,6 +114,8 @@ function photoUrl(item) {
   if (!photoUrls.has(item.id)) photoUrls.set(item.id, URL.createObjectURL(item.photo));
   return photoUrls.get(item.id);
 }
+
+const photoImage = (item, alt) => h('img', { src: photoUrl(item), alt, loading: 'lazy', decoding: 'async' });
 
 async function addPhoto(photo) {
   const item = {
@@ -273,14 +277,14 @@ function renderStatus(item) {
   if (item.status === 'error') {
     return h('div', { class: 'status error' },
       renderQuick(item),
-      h('img', { src: photoUrl(item), alt: '촬영한 문제 사진' }),
+      photoImage(item, '촬영한 문제 사진'),
       h('p', {}, item.error),
       h('button', { class: 'btn', onclick: () => enqueue(item) }, '다시 시도'));
   }
   return h('div', { class: 'status' },
     renderQuick(item),
     h('p', {}, item.status === 'queued' ? '풀이 순서를 기다리는 중...' : '풀이 진행 중...'),
-    h('img', { src: photoUrl(item), alt: '촬영한 문제 사진' }));
+    photoImage(item, '촬영한 문제 사진'));
 }
 
 const TRAP_VERDICTS = {
@@ -331,7 +335,7 @@ function renderResult(item) {
   return h('div', { class: 'card' },
     h('div', { class: 'head' },
       h('button', { class: 'thumb', 'aria-label': '사진 크게 보기', onclick: () => zoomPhoto(item) },
-        h('img', { src: photoUrl(item), alt: '' })),
+        photoImage(item, '')),
       h('div', { class: 'answer' },
         h('small', {}, `정답 · 신뢰도 ${CONFIDENCE[result.confidence]}${quickAgrees ? ' · 빠른 답과 같음' : ''}`),
         h('strong', {}, `${result.answer_label}${correct ? `) ${correct.text_ko}` : ''}`))),
@@ -445,7 +449,9 @@ function zoomPhoto(item) {
 let stream = null;
 
 function showCameraFallback(reason) {
+  // 기본 카메라는 앱 밖으로 나가서 브라우저가 메모리 부족으로 닫힐 수 있으므로 앱 안 카메라가 안 될 때만 보여준다.
   $('camFallback').hidden = false;
+  $('nativeLabel').hidden = false;
   $('camReason').textContent = reason;
   $('shutter').disabled = true;
 }
@@ -459,10 +465,11 @@ async function startCamera() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } },
     });
     video.srcObject = stream;
     $('camFallback').hidden = true;
+    $('nativeLabel').hidden = true;
     $('shutter').disabled = false;
   } catch {
     showCameraFallback('카메라를 켤 수 없어요. 권한을 허용하거나 아래 "기본 카메라" 버튼으로 찍어 주세요.');

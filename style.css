@@ -96,6 +96,8 @@ button, input, select { font: inherit; color: inherit; }
   overflow-y: auto;
   overflow-x: hidden;
 }
+/* 화면 밖 카드는 그리지 않아서 사진이 메모리를 차지하지 않게 한다. */
+.slide:not(#cam) { content-visibility: auto; }
 
 .card { padding: 16px 16px 32px; }
 
@@ -155,6 +157,7 @@ button, input, select { font: inherit; color: inherit; }
 }
 #shutter:active { transform: scale(.94); }
 #shutter:disabled { background: #555; background-clip: content-box; }
+.side[hidden] { display: none; }
 .side {
   padding: 10px 12px;
   color: #fff;
