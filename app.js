@@ -1,4 +1,4 @@
-import { MODELS, SOURCE_PROVIDERS, costOf, quickSolve, solve } from './api.js';
+import { MODELS, QUICK_LEVELS, SOURCE_PROVIDERS, costOf, quickSolve, solve } from './api.js';
 import { DIFFICULTY_LABELS, TRAP_LABELS } from './prompt.js';
 import { appendLog, clearItems, loadItems, readLog, saveItem } from './store.js';
 
@@ -18,6 +18,8 @@ const defaults = {
   model: 'claude-haiku-5-5',
   effort: 'medium',
   autoSources: false,
+  quickEnabled: true,
+  quickLevel: 'brief',
   budget: 10,
   target: 300,
 };
@@ -161,13 +163,15 @@ function pump() {
 }
 
 async function quickAnswer(item) {
-  if (item.quick || item.solve || quickRunning.has(item.id)) return;
+  // 같은 단계로 이미 얻은 답은 다시 요청하지 않는다. 단계를 바꾸고 다시 풀면 새로 받아서 비교할 수 있다.
+  if (!settings.quickEnabled || item.quick?.level === settings.quickLevel || quickRunning.has(item.id)) return;
   quickRunning.add(item.id);
+  item.quick = null;
   item.quickError = null;
   refresh(item);
   const startedAt = performance.now();
   try {
-    item.quick = await quickSolve(await toBase64(item.photo), settings.apiKey);
+    item.quick = await quickSolve(await toBase64(item.photo), settings.apiKey, settings.quickLevel);
     item.quick.ms = performance.now() - startedAt;
   } catch (error) {
     item.quickError = error.message;
@@ -226,7 +230,8 @@ function logEntry(item) {
     `[번역]\n${result.question_ko}`,
     ...result.choices.map((c) => `${c.label}) ${c.text_ko}${c.is_correct ? ' ← 정답' : ''}`),
     `[정답] ${result.answer_label} (신뢰도 ${result.confidence})`,
-    item.quick && `[빠른 답] ${item.quick.result.answer_label} (${seconds(item.quick.ms)}초)`,
+    item.quick && `[빠른 답] ${item.quick.result.answer_label} `
+      + `(${QUICK_LEVELS[item.quick.level]?.label ?? '즉답'}, ${seconds(item.quick.ms)}초)`,
     `[해설]\n${result.explanation_ko}`,
     result.difficulty && `[난이도] ${DIFFICULTY_LABELS[result.difficulty.tier]} `
       + `(예상 정답률 ${result.difficulty.estimated_correct_rate}%): ${result.difficulty.reason}`,
@@ -266,7 +271,8 @@ function renderQuick(item) {
   if (item.quick) {
     return h('div', { class: 'quick' },
       h('small', {}, `빠른 답 · ${seconds(item.quick.ms)}초 · 풀이로 확인 전`),
-      h('strong', {}, item.quick.result.answer_label));
+      h('strong', {}, item.quick.result.answer_label),
+      item.quick.result.reasoning && h('small', {}, item.quick.result.reasoning));
   }
   if (quickRunning.has(item.id)) return h('div', { class: 'quick' }, h('small', {}, '빠른 답 찾는 중...'));
   if (item.quickError) return h('div', { class: 'quick' }, h('small', {}, `빠른 답 실패: ${item.quickError}`));
@@ -295,6 +301,7 @@ const TRAP_VERDICTS = {
 const CONFIDENCE = { high: '높음', medium: '보통', low: '낮음' };
 
 const bareLabel = (label) => label.replace(/[\s.)）]/g, '');
+const quickAgrees = (item) => bareLabel(item.quick.result.answer_label) === bareLabel(item.solve.result.answer_label);
 
 function renderTrap(trap) {
   return [
@@ -330,17 +337,16 @@ function renderProvider(item, provider) {
 function renderResult(item) {
   const { result, model } = item.solve;
   const correct = result.choices.find((choice) => choice.is_correct);
-  const quickLabel = item.quick?.result.answer_label;
-  const quickAgrees = quickLabel != null && bareLabel(quickLabel) === bareLabel(result.answer_label);
+  const agrees = item.quick ? quickAgrees(item) : null;
   return h('div', { class: 'card' },
     h('div', { class: 'head' },
       h('button', { class: 'thumb', 'aria-label': '사진 크게 보기', onclick: () => zoomPhoto(item) },
         photoImage(item, '')),
       h('div', { class: 'answer' },
-        h('small', {}, `정답 · 신뢰도 ${CONFIDENCE[result.confidence]}${quickAgrees ? ' · 빠른 답과 같음' : ''}`),
+        h('small', {}, `정답 · 신뢰도 ${CONFIDENCE[result.confidence]}${agrees ? ' · 빠른 답과 같음' : ''}`),
         h('strong', {}, `${result.answer_label}${correct ? `) ${correct.text_ko}` : ''}`))),
-    quickLabel != null && !quickAgrees && h('div', { class: 'notice detected' },
-      `빠른 답(${quickLabel})과 달라요. 풀이 결과 ${result.answer_label}를 따르세요.`),
+    agrees === false && h('div', { class: 'notice detected' },
+      `빠른 답(${item.quick.result.answer_label})과 달라요. 풀이 결과 ${result.answer_label}를 따르세요.`),
     result.image_quality !== 'good' && h('div', { class: 'notice' },
       `사진이 잘 안 읽혀요. ${result.image_note}`),
     result.trap_check.verdict !== 'clean' && h('div', { class: `notice ${result.trap_check.verdict}` },
@@ -498,6 +504,8 @@ function openSettings() {
   $('model').value = settings.model;
   $('effort').value = settings.effort;
   $('autoSources').checked = settings.autoSources;
+  $('quickEnabled').checked = settings.quickEnabled;
+  $('quickLevel').value = settings.quickLevel;
   $('budget').value = settings.budget;
   $('target').value = settings.target;
   const { sample, total, average, projected } = spending();
@@ -507,15 +515,26 @@ function openSettings() {
     $('stats').textContent = `지금까지 총 ${usd(total)}\n`
       + `${settings.model} ${sample.length}문제 기준 평균 ${usd(average)}, ${(avgMs / 1000).toFixed(1)}초\n`
       + `${settings.target}문제 예상 $${projected.toFixed(2)} (${verdict}, 예산 $${settings.budget})`;
-    const quick = sample.filter((item) => item.quick);
-    if (quick.length > 0) {
-      const quickMs = quick.reduce((sum, item) => sum + item.quick.ms, 0) / quick.length;
-      $('stats').textContent += `\n빠른 답 평균 ${seconds(quickMs)}초`;
-    }
+    $('stats').textContent += quickStats();
   } else {
     $('stats').textContent = '';
   }
   $('settings').showModal();
+}
+
+// 단계별로 풀이 결과와 얼마나 같았는지 보여준다. 풀이 결과도 공식 정답은 아니다.
+function quickStats() {
+  let text = '';
+  for (const [id, { label }] of Object.entries(QUICK_LEVELS)) {
+    const done = items.filter((item) => item.quick?.level === id && item.solve);
+    if (done.length === 0) continue;
+    const agreed = done.filter(quickAgrees).length;
+    const average = (pick) => done.reduce((sum, item) => sum + pick(item), 0) / done.length;
+    text += `\n빠른 답 ${label}: 풀이와 일치 ${agreed}/${done.length}, `
+      + `평균 ${seconds(average((item) => item.quick.ms))}초, `
+      + `${usd(average((item) => costOf(item.quick.usage, item.quick.model)))}`;
+  }
+  return text;
 }
 
 function saveSettings() {
@@ -523,6 +542,8 @@ function saveSettings() {
   settings.model = $('model').value;
   settings.effort = $('effort').value;
   settings.autoSources = $('autoSources').checked;
+  settings.quickEnabled = $('quickEnabled').checked;
+  settings.quickLevel = $('quickLevel').value;
   settings.budget = Number($('budget').value) || defaults.budget;
   settings.target = Number($('target').value) || defaults.target;
   try {
@@ -604,6 +625,8 @@ async function restore() {
 }
 
 $('model').append(...Object.entries(MODELS).map(([id, { label }]) => h('option', { value: id }, label)));
+$('quickLevel').append(...Object.entries(QUICK_LEVELS).map(([id, { label, detail }]) =>
+  h('option', { value: id }, `${label} ${detail}`)));
 wireEvents();
 await restore();
 goTo(items.length);

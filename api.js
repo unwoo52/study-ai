@@ -1,5 +1,6 @@
 import {
-  QUICK_REQUEST, QUICK_SCHEMA, QUICK_SYSTEM, SOLVE_REQUEST, SOLVE_SCHEMA, SOLVE_SYSTEM, WEB_SYSTEM, webRequest,
+  QUICK_REASON_SCHEMA, QUICK_REASON_SYSTEM, QUICK_REQUEST, QUICK_SCHEMA, QUICK_SYSTEM,
+  SOLVE_REQUEST, SOLVE_SCHEMA, SOLVE_SYSTEM, WEB_SYSTEM, webRequest,
 } from './prompt.js';
 
 // 달러 / 100만 토큰. 가격이 바뀌면 여기만 고친다.
@@ -11,6 +12,33 @@ export const MODELS = {
 
 // 빠른 답은 설정의 모델과 상관없이 가장 빠르고 저렴한 모델을 쓴다.
 export const QUICK_MODEL = 'claude-haiku-5-5';
+
+// 빠른 답 성능 단계. 위로 갈수록 빠르고 아래로 갈수록 정확하다.
+export const QUICK_LEVELS = {
+  instant: {
+    label: '즉답',
+    detail: '(가장 빠름)',
+    system: QUICK_SYSTEM,
+    schema: QUICK_SCHEMA,
+    maxTokens: 128,
+    thinking: { type: 'disabled' },
+  },
+  brief: {
+    label: '짧은 추론',
+    detail: '(균형, 비용 약 2배)',
+    system: QUICK_REASON_SYSTEM,
+    schema: QUICK_REASON_SCHEMA,
+    maxTokens: 500,
+    thinking: { type: 'disabled' },
+  },
+  thinking: {
+    label: '생각 켜기',
+    detail: '(가장 정확, 비용 약 3배, 5초 넘을 수 있음)',
+    system: QUICK_REASON_SYSTEM,
+    schema: QUICK_REASON_SCHEMA,
+    maxTokens: 1500,
+  },
+};
 
 const WEB_SEARCH_PRICE = 0.01;
 const MAX_ATTEMPTS = 4;
@@ -94,18 +122,24 @@ const photoMessage = (imageBase64, request) => ({
   ],
 });
 
-// 생각 단계를 끄고 짧게 받아서 몇 초 안에 답을 얻는다. 늦어지면 의미가 없어서 재시도도 한 번만 한다.
-export async function quickSolve(imageBase64, apiKey) {
+// 늦어지면 의미가 없어서 재시도도 한 번만 한다.
+export async function quickSolve(imageBase64, apiKey, levelId) {
+  const level = QUICK_LEVELS[levelId];
   const data = await callClaude({
     model: QUICK_MODEL,
-    max_tokens: 128,
-    system: QUICK_SYSTEM,
-    thinking: { type: 'disabled' },
-    output_config: { effort: 'low', format: { type: 'json_schema', schema: QUICK_SCHEMA } },
+    max_tokens: level.maxTokens,
+    system: level.system,
+    ...(level.thinking && { thinking: level.thinking }),
+    output_config: { effort: 'low', format: { type: 'json_schema', schema: level.schema } },
     messages: [photoMessage(imageBase64, QUICK_REQUEST)],
   }, apiKey, { attempts: 2, timeoutMs: QUICK_TIMEOUT_MS });
   checkStop(data);
-  return { result: JSON.parse(textOf(data.content)), usage: readUsage(data), model: data.model ?? QUICK_MODEL };
+  return {
+    result: JSON.parse(textOf(data.content)),
+    usage: readUsage(data),
+    model: data.model ?? QUICK_MODEL,
+    level: levelId,
+  };
 }
 
 export async function solve(imageBase64, { apiKey, model, effort }) {
