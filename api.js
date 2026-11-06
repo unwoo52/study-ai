@@ -61,13 +61,20 @@ function readUsage(data) {
   };
 }
 
-function friendlyError(status, message) {
-  if (status === 401) return 'API 키가 올바르지 않아요. 설정에서 확인해 주세요.';
-  if (/credit balance/i.test(message)) return 'API 크레딧 잔액이 부족해요. 충전 후 다시 시도해 주세요.';
-  return `API 오류 ${status}: ${message}`;
+// kind로 대기열이 다음 행동을 정한다.
+// fatal: 사용자가 고쳐야 함, rate: 요청 한도, transient: 잠시 뒤 다시, 없음: 이 문제만 실패.
+function apiError(status, message) {
+  const noCredit = /credit balance/i.test(message);
+  if (status === 401) return Object.assign(new Error('API 키가 올바르지 않아요. 설정에서 확인해 주세요.'), { kind: 'fatal' });
+  if (noCredit) return Object.assign(new Error('API 크레딧 잔액이 부족해요. 충전 후 다시 시작해 주세요.'), { kind: 'fatal' });
+  const error = new Error(`API 오류 ${status}: ${message}`);
+  if (status === 403) error.kind = 'fatal';
+  else if (status === 429) error.kind = 'rate';
+  else if (status >= 500 || status === 408 || status === 409) error.kind = 'transient';
+  return error;
 }
 
-async function callClaude(body, apiKey, { attempts = MAX_ATTEMPTS, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+async function callClaude(body, apiKey, { attempts = MAX_ATTEMPTS, timeoutMs = REQUEST_TIMEOUT_MS, stopOnRate = false } = {}) {
   const headers = {
     'content-type': 'application/json',
     'x-api-key': apiKey,
@@ -92,16 +99,24 @@ async function callClaude(body, apiKey, { attempts = MAX_ATTEMPTS, timeoutMs = R
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
-      lastError = Object.assign(new Error(`네트워크 오류: ${error.message}`), { delay: 2000 * 2 ** attempt });
+      lastError = Object.assign(new Error(`네트워크 오류: ${error.message}`), { kind: 'transient', delay: 2000 * 2 ** attempt });
       continue;
     }
-    if (response.ok) return response.json();
+    if (response.ok) {
+      try {
+        return await response.json();
+      } catch (error) {
+        lastError = Object.assign(new Error(`네트워크 오류: ${error.message}`), { kind: 'transient', delay: 2000 * 2 ** attempt });
+        continue;
+      }
+    }
 
     const detail = await response.json().catch(() => null);
-    const error = new Error(friendlyError(response.status, detail?.error?.message ?? response.statusText));
-    if (response.status !== 429 && response.status < 500) throw error;
+    const error = apiError(response.status, detail?.error?.message ?? response.statusText);
+    if (error.kind !== 'rate' && error.kind !== 'transient') throw error;
     const retryAfter = Number(response.headers.get('retry-after'));
     error.delay = retryAfter > 0 ? retryAfter * 1000 : 2000 * 2 ** attempt;
+    if (error.kind === 'rate' && stopOnRate) throw error;
     lastError = error;
   }
   throw lastError;
@@ -113,6 +128,14 @@ function checkStop(data) {
 }
 
 const textOf = (content) => content.filter((block) => block.type === 'text').map((block) => block.text).join('');
+
+function parseResult(data) {
+  try {
+    return JSON.parse(textOf(data.content));
+  } catch {
+    throw Object.assign(new Error('응답을 읽지 못했어요.'), { kind: 'transient' });
+  }
+}
 
 const photoMessage = (imageBase64, request) => ({
   role: 'user',
@@ -132,10 +155,10 @@ export async function quickSolve(imageBase64, apiKey, levelId) {
     ...(level.thinking && { thinking: level.thinking }),
     output_config: { effort: 'low', format: { type: 'json_schema', schema: level.schema } },
     messages: [photoMessage(imageBase64, QUICK_REQUEST)],
-  }, apiKey, { attempts: 2, timeoutMs: QUICK_TIMEOUT_MS });
+  }, apiKey, { attempts: 2, timeoutMs: QUICK_TIMEOUT_MS, stopOnRate: true });
   checkStop(data);
   return {
-    result: JSON.parse(textOf(data.content)),
+    result: parseResult(data),
     usage: readUsage(data),
     model: data.model ?? QUICK_MODEL,
     level: levelId,
@@ -149,9 +172,9 @@ export async function solve(imageBase64, { apiKey, model, effort }) {
     system: SOLVE_SYSTEM,
     output_config: { effort, format: { type: 'json_schema', schema: SOLVE_SCHEMA } },
     messages: [photoMessage(imageBase64, SOLVE_REQUEST)],
-  }, apiKey);
+  }, apiKey, { stopOnRate: true });
   checkStop(data);
-  return { result: JSON.parse(textOf(data.content)), usage: readUsage(data), model: data.model ?? model };
+  return { result: parseResult(data), usage: readUsage(data), model: data.model ?? model };
 }
 
 function collectLinks(content) {

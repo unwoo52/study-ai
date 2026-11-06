@@ -18,6 +18,11 @@
     </button>
   </header>
 
+  <div id="banner" role="status" hidden>
+    <span id="bannerText"></span>
+    <button id="bannerAction" class="btn" hidden></button>
+  </div>
+
   <main id="deck">
     <section id="cam" class="slide">
       <video id="video" autoplay playsinline muted></video>
@@ -99,6 +104,14 @@
 
   <dialog id="zoom"><img alt="촬영한 문제 사진"></dialog>
 
+  <script>
+    addEventListener('error', function (event) {
+      if (window.appStarted || (event.target !== window && event.target.tagName !== 'SCRIPT')) return;
+      var toast = document.getElementById('toast');
+      toast.textContent = '앱을 불러오지 못했어요. 새로고침해 주세요.';
+      toast.hidden = false;
+    }, true);
+  </script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

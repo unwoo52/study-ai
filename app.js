@@ -1,10 +1,20 @@
-import { MODELS, QUICK_LEVELS, SOURCE_PROVIDERS, costOf, quickSolve, solve } from './api.js';
+import { MODELS, QUICK_LEVELS, QUICK_MODEL, SOURCE_PROVIDERS, costOf, quickSolve, solve } from './api.js';
 import { DIFFICULTY_LABELS, TRAP_LABELS } from './prompt.js';
 import { appendLog, clearItems, loadItems, readLog, saveItem } from './store.js';
 
 const IMAGE_MAX_EDGE = 2000;
 const IMAGE_QUALITY = 0.85;
 const MAX_PARALLEL = 3;
+const QUICK_PARALLEL = 2;
+const MAX_ITEM_FAILS = 5;
+const MODEL_FALLBACK_AFTER = 2;
+const QUICK_MAX_FAILS = 2;
+const RATE_COOLDOWN_MS = 15000;
+const FAIL_COOLDOWN_MS = 3000;
+const SPEEDUP_AFTER = 5;
+const RENDER_RADIUS = 2;
+const PROGRESS_MIN = 3;
+const UPDATE_DELAY_MS = 120;
 
 const $ = (id) => document.getElementById(id);
 const deck = $('deck');
@@ -43,7 +53,19 @@ const slides = new Map();
 const chips = new Map();
 const photoUrls = new Map();
 const quickRunning = new Set();
+const quickWaiting = [];
+const rendered = new Set();
 let running = 0;
+let parallel = MAX_PARALLEL;
+let okStreak = 0;
+let cooldownUntil = 0;
+let cooldownTimer = null;
+let pausedReason = null;
+let storageProblem = null;
+let updateTimer = null;
+let activeChip = null;
+let wakeLock = null;
+let wakeRequesting = false;
 
 function h(tag, attrs = {}, ...children) {
   const element = document.createElement(tag);
@@ -67,7 +89,7 @@ function itemCost(item) {
   return total;
 }
 
-const questionNumber = (item) => item.solve?.result.question_number ?? item.quick?.result.question_number ?? null;
+const questionNumber = (item) => item.solve?.result?.question_number ?? item.quick?.result?.question_number ?? null;
 const itemLabel = (item) => questionNumber(item) ?? (item.solve ? '?' : '…');
 
 // 화면의 문제 번호 순서. 번호를 모르는 사진은 뒤로 보내고 찍은 순서를 유지한다.
@@ -94,18 +116,31 @@ async function shrink(source, width, height) {
   canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
   const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', IMAGE_QUALITY));
   canvas.width = 0;
+  if (!blob) throw new Error('사진을 처리하지 못했어요. 다시 찍어 주세요.');
   return blob;
 }
 
 async function addFiles(files) {
+  let failed = 0;
   for (const file of files) {
-    const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
-    await addPhoto(await shrink(bitmap, bitmap.width, bitmap.height));
-    bitmap.close();
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+      await addPhoto(await shrink(bitmap, bitmap.width, bitmap.height));
+    } catch {
+      failed++;
+    } finally {
+      bitmap?.close();
+    }
   }
+  if (failed > 0) showError(`${failed}장은 불러오지 못했어요.`);
 }
 
 const toBase64 = (blob) => new Promise((resolve, reject) => {
+  if (!blob) {
+    reject(new Error('사진이 없어서 풀 수 없어요. 다시 찍어 주세요.'));
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => resolve(reader.result.split(',')[1]);
   reader.onerror = () => reject(reader.error);
@@ -113,6 +148,7 @@ const toBase64 = (blob) => new Promise((resolve, reject) => {
 });
 
 function photoUrl(item) {
+  if (!item.photo) return '';
   if (!photoUrls.has(item.id)) photoUrls.set(item.id, URL.createObjectURL(item.photo));
   return photoUrls.get(item.id);
 }
@@ -132,73 +168,201 @@ async function addPhoto(photo) {
   items.push(item);
   addSlide(item);
   if (stayOnCamera) deck.scrollLeft = deck.scrollWidth;
-  await saveItem(item);
+  await persist(item);
   enqueue(item);
+}
+
+// 저장에 실패해도 풀이는 계속한다. 카드는 앱을 닫기 전까지 화면에 남는다.
+async function persist(item) {
+  try {
+    await saveItem(item);
+    storageProblem = null;
+  } catch (error) {
+    storageProblem = error?.name === 'QuotaExceededError' ? '저장 공간이 부족해요.' : '기기에 저장하지 못했어요.';
+  }
+  scheduleUpdate();
 }
 
 /* 분석 대기열 */
 
 function enqueue(item) {
+  if (item.status === 'running' || queue.includes(item)) return;
   item.status = 'queued';
   item.error = null;
   refresh(item);
   queue.push(item);
+  if (needsQuick(item)) quickWaiting.push(item);
   pump();
 }
+
+function requeue(item, atFront) {
+  item.status = 'queued';
+  if (atFront) queue.unshift(item);
+  else queue.push(item);
+}
+
+const remaining = () => queue.length + running;
+const canSendSoon = () => pausedReason === null && navigator.onLine;
+const canSend = () => canSendSoon() && Date.now() >= cooldownUntil;
 
 function pump() {
   if (!settings.apiKey) {
     if (queue.length > 0 && !$('settings').open) openSettings();
     return;
   }
-  // 빠른 답은 풀이 순서를 기다리지 않고 바로 보낸다.
-  queue.forEach(quickAnswer);
-  while (running < MAX_PARALLEL && queue.length > 0) {
-    running++;
-    analyze(queue.shift()).finally(() => {
-      running--;
-      pump();
-    });
+  if (canSend()) {
+    // 빠른 답은 방금 찍은 사진부터 처리한다. 밀린 사진은 풀이가 먼저 끝나면 건너뛴다.
+    // 요청 한도에 걸린 직후에는 풀이가 먼저 진행되도록 빠른 답을 줄인다.
+    const quickLimit = parallel < MAX_PARALLEL ? 1 : QUICK_PARALLEL;
+    while (quickRunning.size < quickLimit && quickWaiting.length > 0) quickAnswer(quickWaiting.pop());
+    while (running < parallel && queue.length > 0) {
+      running++;
+      analyze(queue.shift()).finally(() => {
+        running--;
+        pump();
+      });
+    }
   }
+  keepAwake();
+  scheduleUpdate();
+}
+
+function startCooldown(ms) {
+  cooldownUntil = Math.max(cooldownUntil, Date.now() + ms);
+  clearTimeout(cooldownTimer);
+  cooldownTimer = setTimeout(pump, cooldownUntil - Date.now() + 50);
+}
+
+function noteSuccess() {
+  okStreak++;
+  if (okStreak >= SPEEDUP_AFTER && parallel < MAX_PARALLEL) {
+    parallel++;
+    okStreak = 0;
+  }
+}
+
+// 전체 대기열을 멈춰야 하는 실패면 true를 돌려준다. 이때 사진은 실패가 아니라 대기 상태로 남는다.
+function noteFailure(error) {
+  if (error.kind === 'fatal') {
+    pausedReason = error.message;
+    return true;
+  }
+  if (error.kind === 'rate') {
+    parallel = Math.max(1, parallel - 1);
+    okStreak = 0;
+    startCooldown(error.delay ?? RATE_COOLDOWN_MS);
+    return true;
+  }
+  return false;
+}
+
+function resume() {
+  pausedReason = null;
+  cooldownUntil = 0;
+  pump();
+}
+
+function retryFailed() {
+  for (const item of items.filter(({ status }) => status === 'error')) {
+    item.fails = 0;
+    enqueue(item);
+  }
+}
+
+// 대량으로 푸는 동안 화면이 꺼지면 브라우저가 멈추므로 켜둔다.
+async function keepAwake() {
+  const wanted = remaining() > 0 && !document.hidden && canSendSoon();
+  if (wanted && !wakeLock && !wakeRequesting && navigator.wakeLock) {
+    wakeRequesting = true;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch {
+      // 배터리 절약 모드 등에서는 거절될 수 있다. 풀이에는 지장이 없다.
+    }
+    wakeRequesting = false;
+  } else if (!wanted && wakeLock) {
+    await wakeLock.release();
+  }
+}
+
+function needsQuick(item) {
+  return settings.quickEnabled
+    && item.quick?.level !== settings.quickLevel
+    && (item.status === 'queued' || item.status === 'running')
+    && !quickRunning.has(item.id)
+    && !quickWaiting.includes(item)
+    && slides.has(item.id);
 }
 
 async function quickAnswer(item) {
   // 같은 단계로 이미 얻은 답은 다시 요청하지 않는다. 단계를 바꾸고 다시 풀면 새로 받아서 비교할 수 있다.
-  if (!settings.quickEnabled || item.quick?.level === settings.quickLevel || quickRunning.has(item.id)) return;
+  if (!needsQuick(item)) return;
   quickRunning.add(item.id);
   item.quick = null;
   item.quickError = null;
   refresh(item);
   const startedAt = performance.now();
+  let retry = false;
   try {
-    item.quick = await quickSolve(await toBase64(item.photo), settings.apiKey, settings.quickLevel);
-    item.quick.ms = performance.now() - startedAt;
+    const quick = await quickSolve(await toBase64(item.photo), settings.apiKey, settings.quickLevel);
+    quick.ms = performance.now() - startedAt;
+    item.quick = quick;
+    noteSuccess();
   } catch (error) {
-    item.quickError = error.message;
+    item.quickFails = (item.quickFails ?? 0) + 1;
+    retry = noteFailure(error) || (error.kind === 'transient' && item.quickFails < QUICK_MAX_FAILS);
+    if (!retry) item.quickError = error.message;
   }
   quickRunning.delete(item.id);
   if (!slides.has(item.id)) return;
-  await saveItem(item);
-  placeInOrder();
+  if (retry) {
+    if (needsQuick(item)) quickWaiting.unshift(item);
+  } else if (item.quick) {
+    await persist(item);
+    placeInOrder();
+  }
   refresh(item);
+  pump();
 }
 
 async function analyze(item) {
+  if (!slides.has(item.id)) return;
   item.status = 'running';
   refresh(item);
   const startedAt = performance.now();
+  // 고른 모델이 계속 실패하면 가장 안정적으로 답하는 Haiku로 대신 푼다.
+  const fallback = (item.fails ?? 0) >= MODEL_FALLBACK_AFTER && settings.model !== QUICK_MODEL;
   try {
-    const solved = await solve(await toBase64(item.photo), settings);
+    const solved = await solve(await toBase64(item.photo), { ...settings, model: fallback ? QUICK_MODEL : settings.model });
     item.solve = solved;
     item.solveMs = performance.now() - startedAt;
     item.sources = {};
     item.status = 'done';
     item.logged = false;
+    item.fails = 0;
+    noteSuccess();
   } catch (error) {
-    item.status = 'error';
-    item.error = error.message;
+    if (!slides.has(item.id)) return;
+    if (noteFailure(error)) {
+      requeue(item, true);
+    } else if (error.kind === 'transient') {
+      if (navigator.onLine) item.fails = (item.fails ?? 0) + 1;
+      if ((item.fails ?? 0) < MAX_ITEM_FAILS) {
+        requeue(item, !navigator.onLine);
+        if (item.fails > 0) startCooldown(FAIL_COOLDOWN_MS * item.fails);
+      } else {
+        item.status = 'error';
+        item.error = error.message;
+        item.retryOnline = true;
+      }
+    } else {
+      item.status = 'error';
+      item.error = error.message;
+    }
   }
-  await saveItem(item);
+  if (!slides.has(item.id)) return;
+  await persist(item);
   placeInOrder();
   refresh(item);
   if (item.status !== 'done') return;
@@ -215,7 +379,8 @@ async function findSource(item, provider) {
   } catch (error) {
     item.sources[provider.id] = { status: 'error', error: error.message };
   }
-  await saveItem(item);
+  if (!slides.has(item.id)) return;
+  await persist(item);
   refresh(item);
 }
 
@@ -250,19 +415,31 @@ function logEntry(item) {
 
 async function logItem(item) {
   if (item.logged) return;
-  item.logged = true;
-  await saveItem(item);
-  await appendLog(logEntry(item));
+  try {
+    await appendLog(logEntry(item));
+    item.logged = true;
+    await persist(item);
+  } catch {
+    storageProblem = '기록 파일에 저장하지 못했어요.';
+    scheduleUpdate();
+  }
 }
 
 async function downloadLog() {
-  const text = await readLog();
+  let text;
+  try {
+    text = await readLog();
+  } catch {
+    showError('기록을 읽지 못했어요.');
+    return;
+  }
   const link = h('a', {
     href: URL.createObjectURL(new Blob(['﻿', text], { type: 'text/plain;charset=utf-8' })),
     download: 'study-log.txt',
   });
   link.click();
-  URL.revokeObjectURL(link.href);
+  // 내려받기가 시작될 시간을 준다.
+  setTimeout(() => URL.revokeObjectURL(link.href), 60000);
 }
 
 /* 카드 그리기 */
@@ -386,6 +563,24 @@ function addSlide(item) {
   refresh(item);
 }
 
+function renderCard(item) {
+  try {
+    return item.status === 'done' ? renderResult(item) : renderStatus(item);
+  } catch {
+    return h('div', { class: 'status error' },
+      h('p', {}, '이 카드를 표시하지 못했어요.'),
+      h('button', { class: 'btn', onclick: () => enqueue(item) }, '다시 풀기'));
+  }
+}
+
+function renderSlide(item) {
+  const slide = slides.get(item.id);
+  const top = slide.scrollTop;
+  rendered.add(item.id);
+  slide.replaceChildren(renderCard(item));
+  slide.scrollTop = top;
+}
+
 function placeInOrder() {
   const index = currentIndex();
   const viewing = items[index];
@@ -407,19 +602,16 @@ function placeInOrder() {
 }
 
 function refresh(item) {
-  const slide = slides.get(item.id);
-  const top = slide.scrollTop;
-  slide.replaceChildren(item.status === 'done' ? renderResult(item) : renderStatus(item));
-  slide.scrollTop = top;
-
   const chip = chips.get(item.id);
-  const verdict = item.status === 'done' ? item.solve.result.trap_check.verdict : '';
-  chip.className = `chip ${item.status} ${verdict}`;
+  if (!chip) return;
+  if (rendered.has(item.id)) renderSlide(item);
+  const verdict = item.status === 'done' ? item.solve?.result?.trap_check?.verdict ?? '' : '';
+  chip.className = `chip ${item.status} ${verdict}${chip === activeChip ? ' active' : ''}`;
   chip.replaceChildren(String(itemLabel(item)));
-  const answer = item.status === 'done' ? item.solve.result.answer_label : item.quick?.result.answer_label;
+  const answer = item.status === 'done' ? item.solve?.result?.answer_label : item.quick?.result?.answer_label;
   if (answer) chip.append(h('b', {}, answer));
   if (item.status === 'error') chip.append('!');
-  updateHeader();
+  scheduleUpdate();
 }
 
 /* 화면 이동 */
@@ -431,18 +623,68 @@ function currentIndex() {
 
 function goTo(index) {
   deck.scrollTo({ left: index * deck.clientWidth, behavior: 'auto' });
-  updateHeader();
+  syncView();
 }
 
-function updateHeader() {
+// 보는 카드와 그 주변만 그린다. 400장을 모두 그려두면 폰 메모리가 부족해진다.
+function syncView() {
   const index = currentIndex();
   $('pos').textContent = index >= items.length ? `촬영 (${items.length}장)` : `${itemLabel(items[index])}번 문제`;
+  const chip = chips.get(items[index]?.id) ?? null;
+  if (chip !== activeChip) {
+    activeChip?.classList.remove('active');
+    chip?.classList.add('active');
+    activeChip = chip;
+    chip?.scrollIntoView({ block: 'nearest' });
+  }
+  const nearby = items.slice(Math.max(0, index - RENDER_RADIUS), index + RENDER_RADIUS + 1);
+  const keep = new Set(nearby.map((item) => item.id));
+  for (const id of rendered) {
+    if (keep.has(id)) continue;
+    rendered.delete(id);
+    slides.get(id)?.replaceChildren();
+    if (photoUrls.has(id)) {
+      URL.revokeObjectURL(photoUrls.get(id));
+      photoUrls.delete(id);
+    }
+  }
+  for (const item of nearby) {
+    if (!rendered.has(item.id)) renderSlide(item);
+  }
+}
+
+// 답이 들어올 때마다 전체를 다시 계산하지 않도록 잠깐 모아서 처리한다.
+function scheduleUpdate() {
+  updateTimer ??= setTimeout(() => {
+    updateTimer = null;
+    syncView();
+    updateTotals();
+    updateBanner();
+  }, UPDATE_DELAY_MS);
+}
+
+function updateBanner() {
+  const left = remaining();
+  const failed = items.filter(({ status }) => status === 'error').length;
+  const parts = [];
+  if (storageProblem) parts.push(`${storageProblem} 기록을 내려받아 두세요.`);
+  if (pausedReason) parts.push(`멈춤: ${pausedReason}`);
+  else if (!navigator.onLine && left > 0) parts.push('인터넷 연결이 없어요. 연결되면 이어서 풀어요.');
+  else if (Date.now() < cooldownUntil) parts.push('요청이 많아서 잠시 쉬었다가 이어서 풀어요.');
+  if (left >= PROGRESS_MIN || (left > 0 && parts.length > 0)) parts.push(`남은 문제 ${left}장`);
+  if (failed > 0) parts.push(`실패 ${failed}장`);
+  $('bannerText').textContent = parts.join(' · ');
+  $('banner').hidden = parts.length === 0;
+  const action = $('bannerAction');
+  action.hidden = !pausedReason && failed === 0;
+  action.textContent = pausedReason ? '다시 시작' : '모두 다시 시도';
+}
+
+function updateTotals() {
   const { sample, total, projected } = spending();
   const estimate = sample.length > 0 ? ` · ${settings.target}문제 예상 $${projected.toFixed(2)}` : '';
   $('spent').textContent = total > 0 ? `${usd(total)}${estimate}` : '';
   $('spent').classList.toggle('over', projected > settings.budget);
-  items.forEach((item, i) => chips.get(item.id).classList.toggle('active', i === index));
-  chips.get(items[index]?.id)?.scrollIntoView({ block: 'nearest' });
 }
 
 function zoomPhoto(item) {
@@ -465,7 +707,7 @@ function showCameraFallback(reason) {
 async function startCamera() {
   if (stream || document.hidden) return;
   if (!navigator.mediaDevices?.getUserMedia) {
-    showCameraFallback('이 주소에서는 앱 안 카메라를 쓸 수 없어요. 아래 "기본 카메라" 버튼으로 찍어 주세요.');
+    showCameraFallback('이 주소에서는 앱 안 카메라를 쓸 수 없어요. 아래 "기본 카메라"나 "갤러리"를 써 주세요.');
     return;
   }
   try {
@@ -474,11 +716,16 @@ async function startCamera() {
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } },
     });
     video.srcObject = stream;
+    // 다른 앱이 카메라를 가져가면 끊긴다.
+    stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+      stopCamera();
+      startCamera();
+    });
     $('camFallback').hidden = true;
     $('nativeLabel').hidden = true;
     $('shutter').disabled = false;
   } catch {
-    showCameraFallback('카메라를 켤 수 없어요. 권한을 허용하거나 아래 "기본 카메라" 버튼으로 찍어 주세요.');
+    showCameraFallback('카메라를 켤 수 없어요. 여기를 눌러 다시 시도하거나 아래 "기본 카메라"나 "갤러리"를 써 주세요.');
   }
 }
 
@@ -488,13 +735,20 @@ function stopCamera() {
 }
 
 async function shoot() {
-  if (!video.videoWidth) return;
+  if (!video.videoWidth) {
+    showError('카메라가 아직 준비되지 않았어요.');
+    return;
+  }
   const flash = $('flash');
   flash.classList.remove('on');
   void flash.offsetWidth;
   flash.classList.add('on');
   navigator.vibrate?.(30);
-  await addPhoto(await shrink(video, video.videoWidth, video.videoHeight));
+  try {
+    await addPhoto(await shrink(video, video.videoWidth, video.videoHeight));
+  } catch (error) {
+    showError(error.message);
+  }
 }
 
 /* 설정 */
@@ -520,6 +774,15 @@ function openSettings() {
     $('stats').textContent = '';
   }
   $('settings').showModal();
+  showStorageUse();
+}
+
+async function showStorageUse() {
+  const estimate = await navigator.storage?.estimate?.().catch(() => null);
+  if (!estimate?.quota) return;
+  const mb = (bytes) => Math.round(bytes / 1e6);
+  const line = `저장 공간 ${mb(estimate.usage)}MB 사용, ${mb(estimate.quota - estimate.usage)}MB 남음`;
+  $('stats').textContent += `${$('stats').textContent ? '\n' : ''}${line}`;
 }
 
 // 단계별로 풀이 결과와 얼마나 같았는지 보여준다. 풀이 결과도 공식 정답은 아니다.
@@ -552,7 +815,7 @@ function saveSettings() {
     // 저장이 막힌 브라우저에서는 이번 접속 동안만 유지된다.
   }
   items.forEach(refresh);
-  pump();
+  resume();
 }
 
 function rerunAll() {
@@ -568,13 +831,17 @@ async function clearAll() {
   await clearItems();
   items.length = 0;
   queue.length = 0;
+  quickWaiting.length = 0;
+  rendered.clear();
+  activeChip = null;
   slides.forEach((slide) => slide.remove());
   chips.forEach((chip) => chip.remove());
   slides.clear();
   chips.clear();
   photoUrls.forEach((url) => URL.revokeObjectURL(url));
   photoUrls.clear();
-  updateHeader();
+  goTo(0);
+  scheduleUpdate();
   $('settings').close();
 }
 
@@ -606,17 +873,63 @@ function wireEvents() {
   $('rerunAll').addEventListener('click', rerunAll);
   $('clearAll').addEventListener('click', clearAll);
   $('zoom').addEventListener('click', () => $('zoom').close());
-  deck.addEventListener('scroll', updateHeader, { passive: true });
-  document.addEventListener('visibilitychange', () => (document.hidden ? stopCamera() : startCamera()));
+  deck.addEventListener('scroll', syncView, { passive: true });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopCamera();
+    } else {
+      startCamera();
+      pump();
+    }
+  });
+  window.addEventListener('offline', scheduleUpdate);
+  window.addEventListener('online', () => {
+    for (const item of items.filter((other) => other.status === 'error' && other.retryOnline)) {
+      item.fails = 0;
+      item.retryOnline = false;
+      enqueue(item);
+    }
+    pump();
+  });
+  $('camFallback').addEventListener('click', startCamera);
+  $('bannerAction').addEventListener('click', () => (pausedReason ? resume() : retryFailed()));
+}
+
+// 앱이 도중에 꺼졌거나 저장본이 손상돼도 나머지 카드는 살린다.
+function repair(item) {
+  item.sources ??= {};
+  for (const [id, source] of Object.entries(item.sources)) {
+    if (source.status === 'running') delete item.sources[id];
+  }
+  if (item.status === 'running') item.status = 'queued';
+  if (!(item.photo instanceof Blob)) item.photo = null;
+  if (item.quick && !(item.quick.result && item.quick.usage)) item.quick = null;
+  const result = item.solve?.result;
+  if (item.solve && !(result?.choices && result.trap_check && item.solve.usage)) {
+    delete item.solve;
+    item.status = 'error';
+    item.error = '저장된 결과가 손상됐어요. 다시 풀어 주세요.';
+  }
 }
 
 async function restore() {
-  const saved = await loadItems();
+  let saved;
+  try {
+    saved = await loadItems();
+  } catch {
+    storageProblem = '저장된 카드를 불러오지 못했어요.';
+    return;
+  }
+  saved = saved.filter((item) => {
+    try {
+      repair(item);
+      return true;
+    } catch {
+      return false;
+    }
+  });
   saved.sort(byQuestionNumber);
   for (const item of saved) {
-    for (const [id, source] of Object.entries(item.sources)) {
-      if (source.status === 'running') delete item.sources[id];
-    }
     items.push(item);
     addSlide(item);
     if (item.status === 'queued' || item.status === 'running') enqueue(item);
@@ -630,6 +943,9 @@ $('quickLevel').append(...Object.entries(QUICK_LEVELS).map(([id, { label, detail
 wireEvents();
 await restore();
 goTo(items.length);
-updateHeader();
+scheduleUpdate();
 startCamera();
+window.appStarted = true;
+navigator.storage?.persist?.();
+navigator.serviceWorker?.register('sw.js').catch(() => {});
 if (!settings.apiKey) openSettings();

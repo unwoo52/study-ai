@@ -62,6 +62,21 @@ button, input, select { font: inherit; color: inherit; }
 #spent { margin-left: auto; color: var(--muted); font-size: 14px; }
 #spent.over { color: var(--bad); }
 
+#banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 14px;
+  line-height: 1.4;
+}
+#banner[hidden] { display: none; }
+#banner .btn { min-height: 36px; background: var(--bg); }
+#banner .btn[hidden] { display: none; }
+
 #toast {
   position: fixed;
   inset: auto 16px 72px;
